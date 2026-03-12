@@ -1,0 +1,34 @@
+# Virtual environments
+les_env/
+venv/
+.env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+
+# MacOS
+.DS_Store
+
+# Simulation outputs
+outputs/
+data/
+results/
+checkpoints/
+*.h5
+*.npz
+*.npy
+
+# Logs
+*.log
+
+# Temporary
+tmp/
