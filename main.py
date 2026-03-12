@@ -4,18 +4,30 @@ from les.config import SimulationConfig
 from les.grid import Grid2D
 from les.initial_conditions import (
     taylor_green_velocity,
-    compute_divergence,
-    compute_speed,
-    trusted_max_abs_divergence,
-    trusted_mean_abs_divergence,
+    gaussian_vortex_velocity,
 )
-from les.particles import initialize_particles_from_grid, particle_count
-from les.reconstruction import (
-    reconstruct_velocity_from_particles,
-    reconstruction_error,
-    relative_l2_error,
-    trusted_relative_l2_error,
-    trusted_reconstruction_error,
+from les.particles import initialize_particles_from_grid
+from les.forcing import zero_forcing
+from les.forcing import constant_forcing
+from les.forcing import swirling_gaussian_forcing
+from les.time_integrator import advance_velocity_one_step
+from les.diagnostics import (
+    kinetic_energy,
+    trusted_kinetic_energy,
+    max_speed,
+    mean_speed,
+    trusted_speed_stats,
+    divergence_stats,
+    trusted_divergence_stats,
+    particle_box_escape_fraction,
+    particle_trusted_fraction,
+)
+from les.plotting import (
+    plot_velocity_snapshot,
+    plot_pressure_gradient_snapshot,
+    plot_mass_field,
+    plot_particles,
+    plot_step_diagnostics,
 )
 
 
@@ -23,7 +35,9 @@ def main() -> None:
     cfg = SimulationConfig()
 
     if cfg.dim != 2:
-        raise ValueError("This prototype is only implemented for the 2D case.")
+        raise ValueError("This prototype only supports dim = 2.")
+
+    rng = np.random.default_rng(cfg.seed)
 
     grid = Grid2D(
         L_box=cfg.L_box,
@@ -32,24 +46,159 @@ def main() -> None:
         L_trust=cfg.L_trust,
     )
 
-    # Initial velocity field on the full padded computational box
-    U0 = taylor_green_velocity(grid)
+    U0 = build_initial_velocity(grid, kind="gaussian_vortex")
+    positions, weights = initialize_particles_from_grid(
+        grid=grid,
+        trusted_only=False,
+    )
 
-    # Initial diagnostics on full box
-    divU0 = compute_divergence(U0, grid.dx, grid.dy)
-    speed0 = compute_speed(U0)
+    if cfg.verbose:
+        print_setup(cfg, grid, positions, weights)
+        print_velocity_diagnostics("Initial diagnostics", U0, grid)
+        print_particle_diagnostics("Initial particle diagnostics", positions, grid)
 
-    # Initial diagnostics on trusted interior only
-    speed0_trusted = grid.restrict_to_trusted(speed0)
-    divU0_trusted = grid.restrict_to_trusted(divU0)
+    if cfg.plot_initial_field:
+        plot_velocity_snapshot(
+            grid=grid,
+            U=U0,
+            title="Initial velocity",
+            trusted_only=True,
+        )
+        plot_particles(
+            grid=grid,
+            positions=positions,
+            title="Initial particles",
+            trusted_only=False,
+        )
 
+    history = {
+        "times": [cfg.t0],
+        "U": [U0.copy()],
+        "positions": [positions.copy()],
+        "weights": [weights.copy()],
+        "source": [],
+        "grad_p": [],
+        "g": [],
+        "mass_field": [],
+    }
+
+    U_n = U0.copy()
+    positions_n = positions.copy()
+    weights_n = weights.copy()
+    t_n = cfg.t0
+
+    for step in range(1, cfg.num_steps + 1):
+        F_n = constant_forcing(grid=grid, t=t_n, fx=0.5, fy=0.0)
+
+        result = advance_velocity_one_step(
+            grid=grid,
+            positions_n=positions_n,
+            weights=weights_n,
+            U_n=U_n,
+            F_n=F_n,
+            dt=cfg.dt,
+            nu=cfg.nu,
+            filter_width=cfg.filter_width,
+            filter_cutoff_sigma=cfg.filter_cutoff_sigma,
+            rng=rng,
+            pressure_cutoff_radius=cfg.pressure_cutoff_radius,
+            pressure_softening=cfg.pressure_softening,
+            apply_les_filter=False,
+            clip_to_box=False,
+            mass_tol=1.0e-14,
+        )
+
+        U_n = result["U_np1"]
+        positions_n = result["positions_np1"]
+        weights_n = result["weights_np1"]
+        t_n = cfg.t0 + step * cfg.dt
+
+        should_save = (step % cfg.save_every == 0) or (step == cfg.num_steps)
+
+        if should_save:
+            history["times"].append(t_n)
+            history["U"].append(U_n.copy())
+            history["positions"].append(positions_n.copy())
+            history["weights"].append(weights_n.copy())
+            history["source"].append(result["source_n"].copy())
+            history["grad_p"].append(result["grad_p_n"].copy())
+            history["g"].append(result["g_n"].copy())
+            history["mass_field"].append(result["mass_field"].copy())
+
+            if cfg.verbose:
+                print()
+                print(f"=== Step {step} / {cfg.num_steps} ===")
+                print(f"time = {t_n:.6f}")
+                print_velocity_diagnostics("Velocity diagnostics", U_n, grid)
+                print_particle_diagnostics(
+                    "Particle diagnostics",
+                    positions_n,
+                    grid,
+                )
+
+            if cfg.plot_velocity_each_save:
+                plot_velocity_snapshot(
+                    grid=grid,
+                    U=U_n,
+                    title=f"Velocity at t = {t_n:.3f}",
+                    trusted_only=True,
+                )
+
+            if cfg.plot_pressure_each_save:
+                plot_pressure_gradient_snapshot(
+                    grid=grid,
+                    grad_p=result["grad_p_n"],
+                    title=f"Pressure gradient at t = {t_n:.3f}",
+                    trusted_only=True,
+                )
+
+            plot_mass_field(
+                grid=grid,
+                mass_field=result["mass_field"],
+                title=f"Mass field at t = {t_n:.3f}",
+                trusted_only=True,
+            )
+
+    if cfg.verbose:
+        print()
+        print("=== Final diagnostics ===")
+        print_velocity_diagnostics("Final velocity diagnostics", U_n, grid)
+        print_particle_diagnostics("Final particle diagnostics", positions_n, grid)
+
+    plot_step_diagnostics(history, grid)
+
+
+def build_initial_velocity(grid: Grid2D, kind: str = "taylor_green") -> np.ndarray:
+    if kind == "taylor_green":
+        return taylor_green_velocity(grid)
+
+    if kind == "gaussian_vortex":
+        return gaussian_vortex_velocity(
+            grid=grid,
+            strength=3.0,
+            sigma=0.3,
+            center=(0.0, 0.0),
+        )
+
+    raise ValueError(f"Unknown initial condition kind: {kind}")
+
+
+def print_setup(
+    cfg: SimulationConfig,
+    grid: Grid2D,
+    positions: np.ndarray,
+    weights: np.ndarray,
+) -> None:
     print("=== Simulation setup ===")
     print(f"dim                       = {cfg.dim}")
     print(f"trusted domain            = [-{cfg.L_trust}, {cfg.L_trust}]^2")
     print(f"padded computational box  = [-{cfg.L_box}, {cfg.L_box}]^2")
     print(f"padding width             = {cfg.pad}")
     print(f"grid                      = {cfg.Nx} x {cfg.Ny}")
-    print(f"trusted grid shape        = {grid.trusted_shape[1]} x {grid.trusted_shape[0]}")
+    print(
+        f"trusted grid shape        = "
+        f"{grid.trusted_shape[1]} x {grid.trusted_shape[0]}"
+    )
     print(f"dx, dy                    = {grid.dx:.6f}, {grid.dy:.6f}")
     print(f"dt                        = {cfg.dt}")
     print(f"T                         = {cfg.T}")
@@ -57,225 +206,55 @@ def main() -> None:
     print(f"nu                        = {cfg.nu}")
     print(f"filter_width              = {cfg.filter_width}")
     print(f"filter_cutoff_sigma       = {cfg.filter_cutoff_sigma}")
+    print(f"pressure_cutoff_radius    = {cfg.pressure_cutoff_radius}")
+    print(f"pressure_softening        = {cfg.pressure_softening}")
     print(f"seed                      = {cfg.seed}")
-    print()
-
-    print("=== Initial field diagnostics (full padded box) ===")
-    print(f"max|u|                    = {np.max(speed0):.6e}")
-    print(f"mean|u|                   = {np.mean(speed0):.6e}")
-    print(f"max|div u|                = {np.max(np.abs(divU0)):.6e}")
-    print(f"mean|div u|               = {np.mean(np.abs(divU0)):.6e}")
-    print()
-
-    print("=== Initial field diagnostics (trusted interior only) ===")
-    print(f"max|u|                    = {np.max(speed0_trusted):.6e}")
-    print(f"mean|u|                   = {np.mean(speed0_trusted):.6e}")
-    print(f"max|div u|                = {trusted_max_abs_divergence(U0, grid):.6e}")
-    print(f"mean|div u|               = {trusted_mean_abs_divergence(U0, grid):.6e}")
-    print()
-
-    if cfg.plot_initial_field:
-        plot_initial_field(grid, U0, speed0, divU0)
-
-    # ------------------------------------------------------------------
-    # Particle initialisation and time-zero reconstruction test
-    # ------------------------------------------------------------------
-    positions, amplitudes, weights = initialize_particles_from_grid(
-        grid=grid,
-        U0=U0,
-        trusted_only=False,
-    )
-
-    print("=== Particle initialisation ===")
-    print(f"number of particles       = {particle_count(positions)}")
-    print(f"particle weight           = {weights[0]:.6e}")
-    print(f"particles on padded box   = True")
-    print()
-
-    U_rec = reconstruct_velocity_from_particles(
-        grid=grid,
-        positions=positions,
-        amplitudes=amplitudes,
-        weights=weights,
-        sigma=cfg.filter_width,
-        cutoff_sigma=cfg.filter_cutoff_sigma,
-    )
-
-    err_vec_full, err_mag_full = reconstruction_error(U0, U_rec)
-    rel_err_full = relative_l2_error(U0, U_rec)
-
-    err_vec_trusted, err_mag_trusted = trusted_reconstruction_error(grid, U0, U_rec)
-    rel_err_trusted = trusted_relative_l2_error(grid, U0, U_rec)
-
-    divU_rec = compute_divergence(U_rec, grid.dx, grid.dy)
-    speed_rec = compute_speed(U_rec)
-
-    speed_rec_trusted = grid.restrict_to_trusted(speed_rec)
-    divU_rec_trusted = grid.restrict_to_trusted(divU_rec)
-
-    print("=== Time-zero reconstruction diagnostics (full padded box) ===")
-    print(f"max|u_rec|                = {np.max(speed_rec):.6e}")
-    print(f"mean|u_rec|               = {np.mean(speed_rec):.6e}")
-    print(f"max|div u_rec|            = {np.max(np.abs(divU_rec)):.6e}")
-    print(f"mean|div u_rec|           = {np.mean(np.abs(divU_rec)):.6e}")
-    print(f"max reconstruction error  = {np.max(err_mag_full):.6e}")
-    print(f"mean reconstruction error = {np.mean(err_mag_full):.6e}")
-    print(f"relative L2 error         = {rel_err_full:.6e}")
-    print()
-
-    print("=== Time-zero reconstruction diagnostics (trusted interior only) ===")
-    print(f"max|u_rec|                = {np.max(speed_rec_trusted):.6e}")
-    print(f"mean|u_rec|               = {np.mean(speed_rec_trusted):.6e}")
-    print(f"max|div u_rec|            = {np.max(np.abs(divU_rec_trusted)):.6e}")
-    print(f"mean|div u_rec|           = {np.mean(np.abs(divU_rec_trusted)):.6e}")
-    print(f"max reconstruction error  = {np.max(err_mag_trusted):.6e}")
-    print(f"mean reconstruction error = {np.mean(err_mag_trusted):.6e}")
-    print(f"relative L2 error         = {rel_err_trusted:.6e}")
-
-    if cfg.plot_reconstruction_test:
-        plot_reconstruction_test(grid, U0, U_rec, err_mag_full)
+    print(f"number of particles       = {positions.shape[0]}")
+    if weights.shape[0] > 0:
+        print(f"particle weight           = {weights[0]:.6e}")
 
 
-def _full_extent(grid: Grid2D) -> list[float]:
-    return [
-        grid.x[0],
-        grid.x[-1] + grid.dx,
-        grid.y[0],
-        grid.y[-1] + grid.dy,
-    ]
-
-
-def _draw_trusted_box(ax, grid: Grid2D) -> None:
-    if grid.L_trust is None:
-        return
-
-    import matplotlib.patches as patches
-
-    L = grid.L_trust
-    rect = patches.Rectangle(
-        (-L, -L),
-        2.0 * L,
-        2.0 * L,
-        fill=False,
-        linewidth=2.0,
-        linestyle="--",
-    )
-    ax.add_patch(rect)
-
-
-def plot_initial_field(
-    grid: Grid2D,
+def print_velocity_diagnostics(
+    label: str,
     U: np.ndarray,
-    speed: np.ndarray,
-    divU: np.ndarray,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    speed_masked = grid.apply_trust_mask(speed, fill_value=np.nan)
-    div_masked = grid.apply_trust_mask(divU, fill_value=np.nan)
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    extent = _full_extent(grid)
-
-    stride_x = max(1, grid.Nx // 24)
-    stride_y = max(1, grid.Ny // 24)
-
-    im0 = axes[0].imshow(
-        speed_masked,
-        extent=extent,
-        origin="lower",
-        aspect="equal",
-    )
-    axes[0].set_title("Initial speed |u| (trusted region)")
-    axes[0].set_xlabel("x")
-    axes[0].set_ylabel("y")
-    _draw_trusted_box(axes[0], grid)
-    fig.colorbar(im0, ax=axes[0])
-
-    im1 = axes[1].imshow(
-        div_masked,
-        extent=extent,
-        origin="lower",
-        aspect="equal",
-    )
-    axes[1].set_title("Initial divergence ∇·u (trusted region)")
-    axes[1].set_xlabel("x")
-    axes[1].set_ylabel("y")
-    _draw_trusted_box(axes[1], grid)
-    fig.colorbar(im1, ax=axes[1])
-
-    axes[2].quiver(
-        grid.X[::stride_y, ::stride_x],
-        grid.Y[::stride_y, ::stride_x],
-        U[::stride_y, ::stride_x, 0],
-        U[::stride_y, ::stride_x, 1],
-    )
-    axes[2].set_title("Initial velocity field on padded box")
-    axes[2].set_xlabel("x")
-    axes[2].set_ylabel("y")
-    axes[2].set_aspect("equal")
-    _draw_trusted_box(axes[2], grid)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_reconstruction_test(
     grid: Grid2D,
-    U0: np.ndarray,
-    U_rec: np.ndarray,
-    err_mag: np.ndarray,
 ) -> None:
-    import matplotlib.pyplot as plt
+    ke_full = kinetic_energy(U, grid)
+    ke_trust = trusted_kinetic_energy(U, grid)
 
-    speed0 = compute_speed(U0)
-    speed_rec = compute_speed(U_rec)
+    max_u = max_speed(U)
+    mean_u = mean_speed(U)
 
-    speed0_masked = grid.apply_trust_mask(speed0, fill_value=np.nan)
-    speed_rec_masked = grid.apply_trust_mask(speed_rec, fill_value=np.nan)
-    err_mag_masked = grid.apply_trust_mask(err_mag, fill_value=np.nan)
+    max_u_t, mean_u_t = trusted_speed_stats(U, grid)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    extent = _full_extent(grid)
+    div_max, div_mean = divergence_stats(U, grid)
+    div_t_max, div_t_mean = trusted_divergence_stats(U, grid)
 
-    im0 = axes[0].imshow(
-        speed0_masked,
-        extent=extent,
-        origin="lower",
-        aspect="equal",
-    )
-    axes[0].set_title("Original speed |u₀| (trusted region)")
-    axes[0].set_xlabel("x")
-    axes[0].set_ylabel("y")
-    _draw_trusted_box(axes[0], grid)
-    fig.colorbar(im0, ax=axes[0])
+    print(f"=== {label} ===")
+    print(f"kinetic energy (full)     = {ke_full:.6e}")
+    print(f"kinetic energy (trusted)  = {ke_trust:.6e}")
+    print(f"max|u| (full)             = {max_u:.6e}")
+    print(f"mean|u| (full)            = {mean_u:.6e}")
+    print(f"max|u| (trusted)          = {max_u_t:.6e}")
+    print(f"mean|u| (trusted)         = {mean_u_t:.6e}")
+    print(f"max|div u| (full)         = {div_max:.6e}")
+    print(f"mean|div u| (full)        = {div_mean:.6e}")
+    print(f"max|div u| (trusted)      = {div_t_max:.6e}")
+    print(f"mean|div u| (trusted)     = {div_t_mean:.6e}")
 
-    im1 = axes[1].imshow(
-        speed_rec_masked,
-        extent=extent,
-        origin="lower",
-        aspect="equal",
-    )
-    axes[1].set_title("Reconstructed speed |u_rec| (trusted region)")
-    axes[1].set_xlabel("x")
-    axes[1].set_ylabel("y")
-    _draw_trusted_box(axes[1], grid)
-    fig.colorbar(im1, ax=axes[1])
 
-    im2 = axes[2].imshow(
-        err_mag_masked,
-        extent=extent,
-        origin="lower",
-        aspect="equal",
-    )
-    axes[2].set_title("Reconstruction error magnitude (trusted region)")
-    axes[2].set_xlabel("x")
-    axes[2].set_ylabel("y")
-    _draw_trusted_box(axes[2], grid)
-    fig.colorbar(im2, ax=axes[2])
+def print_particle_diagnostics(
+    label: str,
+    positions: np.ndarray,
+    grid: Grid2D,
+) -> None:
+    frac_out = particle_box_escape_fraction(positions, grid)
+    frac_trust = particle_trusted_fraction(positions, grid)
 
-    plt.tight_layout()
-    plt.show()
+    print(f"=== {label} ===")
+    print(f"particle count            = {positions.shape[0]}")
+    print(f"fraction outside box      = {frac_out:.6e}")
+    print(f"fraction in trusted region = {frac_trust:.6e}")
 
 
 if __name__ == "__main__":
