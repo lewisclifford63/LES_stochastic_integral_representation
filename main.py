@@ -152,12 +152,12 @@ def main() -> None:
                     trusted_only=True,
                 )
 
-            plot_mass_field(
-                grid=grid,
-                mass_field=result["mass_field"],
-                title=f"Mass field at t = {t_n:.3f}",
-                trusted_only=True,
-            )
+            # plot_mass_field(
+            #     grid=grid,
+            #     mass_field=result["mass_field"],
+            #     title=f"Mass field at t = {t_n:.3f}",
+            #     trusted_only=True,
+            # )
 
     if cfg.verbose:
         print()
@@ -175,8 +175,8 @@ def build_initial_velocity(grid: Grid2D, kind: str = "taylor_green") -> np.ndarr
     if kind == "gaussian_vortex":
         return gaussian_vortex_velocity(
             grid=grid,
-            strength=3.0,
-            sigma=0.3,
+            strength=1.0,
+            sigma=0.4,
             center=(0.0, 0.0),
         )
 
