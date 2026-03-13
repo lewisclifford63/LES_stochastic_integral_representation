@@ -1,8 +1,25 @@
+"""
+Diagnostics for the random LES simulation.
+
+Includes Qian's normalised incompressibility test (Section 4.3.1):
+
+    test(t) = (1/N) * sum_x  |div u(x,t)| / ||grad u(x,t)||_2
+
+where ||grad u||_2 is the Frobenius norm of the velocity gradient tensor.
+This measures how much of the velocity gradient is compressive versus
+shearing/rotational.  A value much less than 1 indicates approximate
+incompressibility.
+"""
+
 import numpy as np
 
 from les.grid import Grid2D
-from les.differential_operators import divergence
+from les.differential_operators import divergence, grad_velocity
 
+
+# ------------------------------------------------------------------ #
+#  Kinetic energy
+# ------------------------------------------------------------------ #
 
 def kinetic_energy(U: np.ndarray, grid: Grid2D) -> float:
     """
@@ -24,6 +41,10 @@ def trusted_kinetic_energy(U: np.ndarray, grid: Grid2D) -> float:
     speed2_trusted = grid.restrict_to_trusted(speed2)
     return 0.5 * float(np.sum(speed2_trusted) * grid.cell_area)
 
+
+# ------------------------------------------------------------------ #
+#  Speed
+# ------------------------------------------------------------------ #
 
 def max_speed(U: np.ndarray) -> float:
     """
@@ -59,6 +80,10 @@ def trusted_speed_stats(U: np.ndarray, grid: Grid2D) -> tuple[float, float]:
     return max_val, mean_val
 
 
+# ------------------------------------------------------------------ #
+#  Raw divergence stats  (existing)
+# ------------------------------------------------------------------ #
+
 def divergence_stats(U: np.ndarray, grid: Grid2D) -> tuple[float, float]:
     """
     Max and mean absolute divergence on the full padded box.
@@ -84,6 +109,101 @@ def trusted_divergence_stats(U: np.ndarray, grid: Grid2D) -> tuple[float, float]
     mean_val = float(np.mean(np.abs(div_trusted)))
     return max_val, mean_val
 
+
+# ------------------------------------------------------------------ #
+#  Qian's normalised incompressibility test  (Section 4.3.1)
+# ------------------------------------------------------------------ #
+
+def _pointwise_normalised_divergence(
+    U: np.ndarray,
+    dx: float,
+    dy: float,
+    grad_norm_floor: float = 1.0e-14,
+) -> np.ndarray:
+    """
+    Compute the pointwise ratio  |div u(x)| / ||grad u(x)||_2
+    at every grid point.
+
+    Parameters
+    ----------
+    U : (Ny, Nx, 2)
+    dx, dy : float
+    grad_norm_floor : float
+        Minimum value of ||grad u|| used in the denominator to avoid
+        division by zero in quiescent regions.
+
+    Returns
+    -------
+    ratio : (Ny, Nx)
+        Pointwise  |div u| / max(||grad u||_2, floor).
+    """
+    divU = divergence(U, dx, dy)                         # (Ny, Nx)
+    gradU = grad_velocity(U, dx, dy)                     # (Ny, Nx, 2, 2)
+
+    # Frobenius norm:  ||grad u||_2 = sqrt( sum_{i,j} (du_i/dx_j)^2 )
+    gradU_norm = np.sqrt(np.sum(gradU * gradU, axis=(-2, -1)))  # (Ny, Nx)
+
+    # Floor the denominator to avoid 0/0 in uniform regions
+    safe_denom = np.maximum(gradU_norm, grad_norm_floor)
+
+    return np.abs(divU) / safe_denom
+
+
+def incompressibility_test(
+    U: np.ndarray,
+    grid: Grid2D,
+    grad_norm_floor: float = 1.0e-14,
+) -> float:
+    """
+    Qian's incompressibility diagnostic on the full padded box:
+
+        test(t) = (1/N) sum_x  |div u(x)| / ||grad u(x)||_2
+
+    A value much less than 1 indicates approximate incompressibility.
+
+    Parameters
+    ----------
+    U : (Ny, Nx, 2)
+    grid : Grid2D
+    grad_norm_floor : float
+        Floor for ||grad u|| to avoid 0/0.
+
+    Returns
+    -------
+    test_value : float
+    """
+    _validate_vector_field(grid, U, "U")
+
+    ratio = _pointwise_normalised_divergence(
+        U, grid.dx, grid.dy, grad_norm_floor,
+    )
+    return float(np.mean(ratio))
+
+
+def trusted_incompressibility_test(
+    U: np.ndarray,
+    grid: Grid2D,
+    grad_norm_floor: float = 1.0e-14,
+) -> float:
+    """
+    Qian's incompressibility diagnostic restricted to the trusted interior.
+
+    Returns
+    -------
+    test_value : float
+    """
+    _validate_vector_field(grid, U, "U")
+
+    ratio = _pointwise_normalised_divergence(
+        U, grid.dx, grid.dy, grad_norm_floor,
+    )
+    ratio_trusted = grid.restrict_to_trusted(ratio)
+    return float(np.mean(ratio_trusted))
+
+
+# ------------------------------------------------------------------ #
+#  Relative L2 change
+# ------------------------------------------------------------------ #
 
 def relative_l2_change(
     U_old: np.ndarray,
@@ -130,6 +250,10 @@ def trusted_relative_l2_change(
     return float(num / den)
 
 
+# ------------------------------------------------------------------ #
+#  Particle diagnostics
+# ------------------------------------------------------------------ #
+
 def particle_box_escape_fraction(
     positions: np.ndarray,
     grid: Grid2D,
@@ -161,6 +285,10 @@ def particle_trusted_fraction(
     inside = grid.points_in_trusted_region(positions)
     return float(np.sum(inside) / positions.shape[0])
 
+
+# ------------------------------------------------------------------ #
+#  Validation helpers
+# ------------------------------------------------------------------ #
 
 def _validate_vector_field(
     grid: Grid2D,

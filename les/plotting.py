@@ -1,10 +1,26 @@
+"""
+Plotting utilities for the random LES simulation.
+
+Includes Qian's normalised incompressibility test in the step-diagnostics
+panel (Section 4.3.1).
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from les.grid import Grid2D
-from les.diagnostics import divergence_stats, trusted_divergence_stats
+from les.diagnostics import (
+    divergence_stats,
+    trusted_divergence_stats,
+    incompressibility_test,
+    trusted_incompressibility_test,
+)
 
+
+# ------------------------------------------------------------------ #
+#  Velocity snapshots
+# ------------------------------------------------------------------ #
 
 def plot_velocity_snapshot(
     grid: Grid2D,
@@ -58,6 +74,10 @@ def plot_velocity_snapshot(
     plt.tight_layout()
     plt.show()
 
+
+# ------------------------------------------------------------------ #
+#  Scalar / pressure / mass / particles
+# ------------------------------------------------------------------ #
 
 def plot_scalar_field(
     grid: Grid2D,
@@ -160,61 +180,6 @@ def plot_particles(
     plt.show()
 
 
-def plot_step_diagnostics(history: dict[str, list], grid: Grid2D) -> None:
-    """
-    Plot basic diagnostics from a saved history dictionary.
-    """
-    times = history["times"]
-    U_list = history["U"]
-
-    kinetic = []
-    max_speed_vals = []
-    div_max = []
-    div_mean = []
-    div_t_max = []
-    div_t_mean = []
-
-    for U in U_list:
-        speed2 = U[..., 0] * U[..., 0] + U[..., 1] * U[..., 1]
-        kinetic.append(0.5 * float(np.sum(speed2) * grid.cell_area))
-
-        speed = np.sqrt(speed2)
-        max_speed_vals.append(float(np.max(speed)))
-
-        a, b = divergence_stats(U, grid)
-        div_max.append(a)
-        div_mean.append(b)
-
-        c, d = trusted_divergence_stats(U, grid)
-        div_t_max.append(c)
-        div_t_mean.append(d)
-
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-
-    axes[0, 0].plot(times, kinetic)
-    axes[0, 0].set_title("Kinetic energy")
-    axes[0, 0].set_xlabel("t")
-
-    axes[0, 1].plot(times, max_speed_vals)
-    axes[0, 1].set_title("Max speed")
-    axes[0, 1].set_xlabel("t")
-
-    axes[1, 0].plot(times, div_max, label="full max")
-    axes[1, 0].plot(times, div_mean, label="full mean")
-    axes[1, 0].set_title("Divergence stats")
-    axes[1, 0].set_xlabel("t")
-    axes[1, 0].legend()
-
-    axes[1, 1].plot(times, div_t_max, label="trusted max")
-    axes[1, 1].plot(times, div_t_mean, label="trusted mean")
-    axes[1, 1].set_title("Trusted divergence stats")
-    axes[1, 1].set_xlabel("t")
-    axes[1, 1].legend()
-
-    plt.tight_layout()
-    plt.show()
-
-
 def plot_mass_field(
     grid: Grid2D,
     mass_field: np.ndarray,
@@ -246,6 +211,94 @@ def plot_mass_field(
     plt.tight_layout()
     plt.show()
 
+
+# ------------------------------------------------------------------ #
+#  Step diagnostics  (now 3x2 with Qian's test)
+# ------------------------------------------------------------------ #
+
+def plot_step_diagnostics(history: dict[str, list], grid: Grid2D) -> None:
+    """
+    Plot basic diagnostics from a saved history dictionary.
+
+    Layout (3 rows x 2 cols):
+        [0,0] Kinetic energy          [0,1] Max speed
+        [1,0] Divergence stats        [1,1] Trusted divergence stats
+        [2,0] Qian test (full)        [2,1] Qian test (trusted)
+    """
+    times = history["times"]
+    U_list = history["U"]
+
+    kinetic = []
+    max_speed_vals = []
+    div_max = []
+    div_mean = []
+    div_t_max = []
+    div_t_mean = []
+    qian_full = []
+    qian_trusted = []
+
+    for U in U_list:
+        speed2 = U[..., 0] * U[..., 0] + U[..., 1] * U[..., 1]
+        kinetic.append(0.5 * float(np.sum(speed2) * grid.cell_area))
+
+        speed = np.sqrt(speed2)
+        max_speed_vals.append(float(np.max(speed)))
+
+        a, b = divergence_stats(U, grid)
+        div_max.append(a)
+        div_mean.append(b)
+
+        c, d = trusted_divergence_stats(U, grid)
+        div_t_max.append(c)
+        div_t_mean.append(d)
+
+        qian_full.append(incompressibility_test(U, grid))
+        qian_trusted.append(trusted_incompressibility_test(U, grid))
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+
+    # Row 0: energy and speed
+    axes[0, 0].plot(times, kinetic)
+    axes[0, 0].set_title("Kinetic energy")
+    axes[0, 0].set_xlabel("t")
+
+    axes[0, 1].plot(times, max_speed_vals)
+    axes[0, 1].set_title("Max speed")
+    axes[0, 1].set_xlabel("t")
+
+    # Row 1: raw divergence
+    axes[1, 0].plot(times, div_max, label="full max")
+    axes[1, 0].plot(times, div_mean, label="full mean")
+    axes[1, 0].set_title("Divergence stats")
+    axes[1, 0].set_xlabel("t")
+    axes[1, 0].legend()
+
+    axes[1, 1].plot(times, div_t_max, label="trusted max")
+    axes[1, 1].plot(times, div_t_mean, label="trusted mean")
+    axes[1, 1].set_title("Trusted divergence stats")
+    axes[1, 1].set_xlabel("t")
+    axes[1, 1].legend()
+
+    # Row 2: Qian's normalised incompressibility test
+    axes[2, 0].plot(times, qian_full)
+    axes[2, 0].set_title(r"Qian test  $\langle |\nabla\cdot u| / \|\nabla u\| \rangle$  (full)")
+    axes[2, 0].set_xlabel("t")
+    axes[2, 0].axhline(y=1.0, color="r", linestyle="--", alpha=0.4, label="threshold = 1")
+    axes[2, 0].legend()
+
+    axes[2, 1].plot(times, qian_trusted)
+    axes[2, 1].set_title(r"Qian test  $\langle |\nabla\cdot u| / \|\nabla u\| \rangle$  (trusted)")
+    axes[2, 1].set_xlabel("t")
+    axes[2, 1].axhline(y=1.0, color="r", linestyle="--", alpha=0.4, label="threshold = 1")
+    axes[2, 1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ------------------------------------------------------------------ #
+#  Internal helpers
+# ------------------------------------------------------------------ #
 
 def _draw_trusted_box(ax, grid: Grid2D) -> None:
     if grid.L_trust is None:

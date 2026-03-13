@@ -105,16 +105,16 @@ class Grid2D:
         return (slice(iy[0], iy[-1] + 1), slice(ix[0], ix[-1] + 1))
 
     @property
-    def extent(self) -> list[float]:
+    def extent(self) -> tuple[float, float, float, float]:
         """
         Matplotlib-friendly plotting extent for the full padded box.
         """
-        return [
+        return (
             self.x[0],
             self.x[-1] + self.dx,
             self.y[0],
             self.y[-1] + self.dy,
-        ]
+        )
 
     @property
     def trusted_extent(self) -> list[float] | None:

@@ -1,3 +1,17 @@
+"""
+Main driver for the random LES simulation using Qian's full
+accumulated-history scheme (eqs. 41-44 / 54-56).
+
+This script lives *outside* the ``les/`` package directory, so all
+imports reach into ``les.*`` explicitly.
+
+The iterative procedure per time-step is:
+
+    U_k, Y_k  -->  Y_{k+1}            (Milstein, eq. 55)
+               +   G_k, u_0  -->  U_{k+1}   (direct particle sum, eq. 56)
+                                  +  dU_{k+1}/dx, F  -->  G_{k+1}  (eq. 44)
+"""
+
 import numpy as np
 
 from les.config import SimulationConfig
@@ -6,11 +20,14 @@ from les.initial_conditions import (
     taylor_green_velocity,
     gaussian_vortex_velocity,
 )
-from les.particles import initialize_particles_from_grid
+from les.particles import initialize_particle_history
 from les.forcing import zero_forcing
 from les.forcing import constant_forcing
 from les.forcing import swirling_gaussian_forcing
-from les.time_integrator import advance_velocity_one_step
+from les.time_integrator import (
+    advance_velocity_one_step_qian,
+    run_time_loop_qian,
+)
 from les.diagnostics import (
     kinetic_energy,
     trusted_kinetic_energy,
@@ -19,6 +36,8 @@ from les.diagnostics import (
     trusted_speed_stats,
     divergence_stats,
     trusted_divergence_stats,
+    incompressibility_test,
+    trusted_incompressibility_test,
     particle_box_escape_fraction,
     particle_trusted_fraction,
 )
@@ -46,16 +65,28 @@ def main() -> None:
         L_trust=cfg.L_trust,
     )
 
+    # ---------------------------------------------------------- #
+    #  Initial velocity
+    # ---------------------------------------------------------- #
     U0 = build_initial_velocity(grid, kind="gaussian_vortex")
-    positions, weights = initialize_particles_from_grid(
+
+    # ---------------------------------------------------------- #
+    #  Particle state  (Qian's accumulated-history structure)
+    # ---------------------------------------------------------- #
+    particle_state = initialize_particle_history(
         grid=grid,
+        U0=U0,
         trusted_only=False,
     )
 
     if cfg.verbose:
-        print_setup(cfg, grid, positions, weights)
+        print_setup(cfg, grid, particle_state)
         print_velocity_diagnostics("Initial diagnostics", U0, grid)
-        print_particle_diagnostics("Initial particle diagnostics", positions, grid)
+        print_particle_diagnostics(
+            "Initial particle diagnostics",
+            particle_state["positions"],
+            grid,
+        )
 
     if cfg.plot_initial_field:
         plot_velocity_snapshot(
@@ -66,107 +97,85 @@ def main() -> None:
         )
         plot_particles(
             grid=grid,
-            positions=positions,
+            positions=particle_state["positions"],
             title="Initial particles",
             trusted_only=False,
         )
 
-    history = {
-        "times": [cfg.t0],
-        "U": [U0.copy()],
-        "positions": [positions.copy()],
-        "weights": [weights.copy()],
-        "source": [],
-        "grad_p": [],
-        "g": [],
-        "mass_field": [],
-    }
+    # ---------------------------------------------------------- #
+    #  Time loop  (Qian's full scheme)
+    # ---------------------------------------------------------- #
+    forcing_function = build_forcing_function()
 
-    U_n = U0.copy()
-    positions_n = positions.copy()
-    weights_n = weights.copy()
-    t_n = cfg.t0
+    history = run_time_loop_qian(
+        grid=grid,
+        particle_state=particle_state,
+        U_0=U0,
+        forcing_function=forcing_function,
+        num_steps=cfg.num_steps,
+        dt=cfg.dt,
+        nu=cfg.nu,
+        filter_width=cfg.filter_width,
+        filter_cutoff_sigma=cfg.filter_cutoff_sigma,
+        rng=rng,
+        t0=cfg.t0,
+        pressure_cutoff_radius=cfg.pressure_cutoff_radius,
+        pressure_softening=cfg.pressure_softening,
+        clip_to_box=False,
+        use_milstein=True,
+        save_every=cfg.save_every,
+    )
 
-    for step in range(1, cfg.num_steps + 1):
-        F_n = constant_forcing(grid=grid, t=t_n, fx=0.5, fy=0.0)
+    # ---------------------------------------------------------- #
+    #  Post-processing output
+    # ---------------------------------------------------------- #
+    if cfg.verbose:
+        print_history_diagnostics(history, grid)
 
-        result = advance_velocity_one_step(
-            grid=grid,
-            positions_n=positions_n,
-            weights=weights_n,
-            U_n=U_n,
-            F_n=F_n,
-            dt=cfg.dt,
-            nu=cfg.nu,
-            filter_width=cfg.filter_width,
-            filter_cutoff_sigma=cfg.filter_cutoff_sigma,
-            rng=rng,
-            pressure_cutoff_radius=cfg.pressure_cutoff_radius,
-            pressure_softening=cfg.pressure_softening,
-            apply_les_filter=False,
-            clip_to_box=False,
-            mass_tol=1.0e-14,
-        )
+    if cfg.plot_velocity_each_save:
+        times = history["times"]
+        states = history["U"]
 
-        U_n = result["U_np1"]
-        positions_n = result["positions_np1"]
-        weights_n = result["weights_np1"]
-        t_n = cfg.t0 + step * cfg.dt
+        for idx in range(1, len(times)):
+            t_val = times[idx]
+            U_val = states[idx]
 
-        should_save = (step % cfg.save_every == 0) or (step == cfg.num_steps)
+            plot_velocity_snapshot(
+                grid=grid,
+                U=U_val,
+                title=f"Velocity at t = {t_val:.3f}",
+                trusted_only=True,
+            )
 
-        if should_save:
-            history["times"].append(t_n)
-            history["U"].append(U_n.copy())
-            history["positions"].append(positions_n.copy())
-            history["weights"].append(weights_n.copy())
-            history["source"].append(result["source_n"].copy())
-            history["grad_p"].append(result["grad_p_n"].copy())
-            history["g"].append(result["g_n"].copy())
-            history["mass_field"].append(result["mass_field"].copy())
+    if cfg.plot_pressure_each_save:
+        times = history["times"]
+        grad_ps = history["grad_p"]
 
-            if cfg.verbose:
-                print()
-                print(f"=== Step {step} / {cfg.num_steps} ===")
-                print(f"time = {t_n:.6f}")
-                print_velocity_diagnostics("Velocity diagnostics", U_n, grid)
-                print_particle_diagnostics(
-                    "Particle diagnostics",
-                    positions_n,
-                    grid,
-                )
+        for idx in range(len(grad_ps)):
+            t_val = times[idx + 1]
+            plot_pressure_gradient_snapshot(
+                grid=grid,
+                grad_p=grad_ps[idx],
+                title=f"Pressure gradient at t = {t_val:.3f}",
+                trusted_only=True,
+            )
 
-            if cfg.plot_velocity_each_save:
-                plot_velocity_snapshot(
-                    grid=grid,
-                    U=U_n,
-                    title=f"Velocity at t = {t_n:.3f}",
-                    trusted_only=True,
-                )
-
-            if cfg.plot_pressure_each_save:
-                plot_pressure_gradient_snapshot(
-                    grid=grid,
-                    grad_p=result["grad_p_n"],
-                    title=f"Pressure gradient at t = {t_n:.3f}",
-                    trusted_only=True,
-                )
-
-            # plot_mass_field(
-            #     grid=grid,
-            #     mass_field=result["mass_field"],
-            #     title=f"Mass field at t = {t_n:.3f}",
-            #     trusted_only=True,
-            # )
+    plot_step_diagnostics(history, grid)
 
     if cfg.verbose:
         print()
         print("=== Final diagnostics ===")
-        print_velocity_diagnostics("Final velocity diagnostics", U_n, grid)
-        print_particle_diagnostics("Final particle diagnostics", positions_n, grid)
+        U_final = history["U"][-1]
+        positions_final = history["positions"][-1]
+        print_velocity_diagnostics("Final velocity diagnostics", U_final, grid)
+        print_particle_diagnostics(
+            "Final particle diagnostics", positions_final, grid,
+        )
 
-    plot_step_diagnostics(history, grid)
 
+# ================================================================== #
+#  Helpers
+# ================================================================== #
 
 def build_initial_velocity(grid: Grid2D, kind: str = "taylor_green") -> np.ndarray:
     if kind == "taylor_green":
@@ -183,13 +192,22 @@ def build_initial_velocity(grid: Grid2D, kind: str = "taylor_green") -> np.ndarr
     raise ValueError(f"Unknown initial condition kind: {kind}")
 
 
+def build_forcing_function():
+    def forcing(grid: Grid2D, t: float) -> np.ndarray:
+        return constant_forcing(grid=grid, t=t, fx=0.5, fy=0.0)
+
+    return forcing
+
+
 def print_setup(
     cfg: SimulationConfig,
     grid: Grid2D,
-    positions: np.ndarray,
-    weights: np.ndarray,
+    particle_state: dict[str, np.ndarray],
 ) -> None:
-    print("=== Simulation setup ===")
+    positions = particle_state["positions"]
+    weights = particle_state["weights"]
+
+    print("=== Simulation setup (Qian scheme) ===")
     print(f"dim                       = {cfg.dim}")
     print(f"trusted domain            = [-{cfg.L_trust}, {cfg.L_trust}]^2")
     print(f"padded computational box  = [-{cfg.L_box}, {cfg.L_box}]^2")
@@ -209,9 +227,12 @@ def print_setup(
     print(f"pressure_cutoff_radius    = {cfg.pressure_cutoff_radius}")
     print(f"pressure_softening        = {cfg.pressure_softening}")
     print(f"seed                      = {cfg.seed}")
+    print(f"SDE integrator            = Milstein (Qian eq. 55)")
+    print(f"deposition                = direct particle sum (no normalisation)")
+    print(f"history                   = full accumulated (Qian eq. 56)")
     print(f"number of particles       = {positions.shape[0]}")
     if weights.shape[0] > 0:
-        print(f"particle weight           = {weights[0]:.6e}")
+        print(f"particle weight (s^d)     = {weights[0]:.6e}")
 
 
 def print_velocity_diagnostics(
@@ -230,6 +251,9 @@ def print_velocity_diagnostics(
     div_max, div_mean = divergence_stats(U, grid)
     div_t_max, div_t_mean = trusted_divergence_stats(U, grid)
 
+    qian_full = incompressibility_test(U, grid)
+    qian_trust = trusted_incompressibility_test(U, grid)
+
     print(f"=== {label} ===")
     print(f"kinetic energy (full)     = {ke_full:.6e}")
     print(f"kinetic energy (trusted)  = {ke_trust:.6e}")
@@ -241,6 +265,8 @@ def print_velocity_diagnostics(
     print(f"mean|div u| (full)        = {div_mean:.6e}")
     print(f"max|div u| (trusted)      = {div_t_max:.6e}")
     print(f"mean|div u| (trusted)     = {div_t_mean:.6e}")
+    print(f"Qian test (full)          = {qian_full:.6e}")
+    print(f"Qian test (trusted)       = {qian_trust:.6e}")
 
 
 def print_particle_diagnostics(
@@ -255,6 +281,25 @@ def print_particle_diagnostics(
     print(f"particle count            = {positions.shape[0]}")
     print(f"fraction outside box      = {frac_out:.6e}")
     print(f"fraction in trusted region = {frac_trust:.6e}")
+
+
+def print_history_diagnostics(
+    history: dict[str, list],
+    grid: Grid2D,
+) -> None:
+    times = history["times"]
+    states = history["U"]
+    positions_list = history["positions"]
+
+    for idx in range(1, len(times)):
+        t_val = times[idx]
+        U_val = states[idx]
+        pos_val = positions_list[idx]
+
+        print()
+        print(f"=== Saved state {idx}  (t = {t_val:.6f}) ===")
+        print_velocity_diagnostics("Velocity diagnostics", U_val, grid)
+        print_particle_diagnostics("Particle diagnostics", pos_val, grid)
 
 
 if __name__ == "__main__":
