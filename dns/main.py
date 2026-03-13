@@ -1,3 +1,13 @@
+"""
+DNS reference simulation using explicit Euler + FFT projection.
+
+Reads grid, dt, nu, T, save_every from ``les.config.SimulationConfig``
+so that the DNS and LES runs use identical physical parameters.
+
+Initial condition and forcing are set to match the LES ``main.py``
+(Qian-aligned Gaussian vortex + localised Gaussian forcing).
+"""
+
 import numpy as np
 
 from les.config import SimulationConfig
@@ -6,7 +16,7 @@ from les.initial_conditions import (
     taylor_green_velocity,
     gaussian_vortex_velocity,
 )
-from les.forcing import zero_forcing, constant_forcing
+from les.forcing import zero_forcing, constant_forcing, gaussian_forcing
 from les.diagnostics import (
     kinetic_energy,
     trusted_kinetic_energy,
@@ -15,6 +25,8 @@ from les.diagnostics import (
     trusted_speed_stats,
     divergence_stats,
     trusted_divergence_stats,
+    incompressibility_test,
+    trusted_incompressibility_test,
 )
 from les.plotting import plot_velocity_snapshot, plot_step_diagnostics
 
@@ -87,10 +99,12 @@ def build_initial_velocity(grid: Grid2D, kind: str = "gaussian_vortex") -> np.nd
         return taylor_green_velocity(grid)
 
     if kind == "gaussian_vortex":
+        # Qian-aligned scales: max speed ~ U0 ~ 32 for Re = 1000
+        # Must match the LES main.py exactly for a fair comparison
         return gaussian_vortex_velocity(
             grid=grid,
-            strength=1.0,
-            sigma=0.4,
+            strength=52.5,
+            sigma=1.57,
             center=(0.0, 0.0),
         )
 
@@ -98,9 +112,19 @@ def build_initial_velocity(grid: Grid2D, kind: str = "gaussian_vortex") -> np.nd
 
 
 def build_forcing_function():
+    """
+    Qian-aligned forcing — must match the LES main.py exactly.
+
+    Localised Gaussian forcing in x with amplitude 10, sigma 1.57.
+    """
     def forcing(grid: Grid2D, t: float) -> np.ndarray:
-        _ = t
-        return constant_forcing(grid=grid, t=t, fx=0.5, fy=0.0)
+        return gaussian_forcing(
+            grid=grid,
+            t=t,
+            amplitude=(10.0, 0.0),
+            sigma=1.57,
+            center=(0.0, 0.0),
+        )
 
     return forcing
 
@@ -136,6 +160,9 @@ def print_velocity_diagnostics(label: str, U: np.ndarray, grid: Grid2D) -> None:
     div_max, div_mean = divergence_stats(U, grid)
     div_t_max, div_t_mean = trusted_divergence_stats(U, grid)
 
+    qian_full = incompressibility_test(U, grid)
+    qian_trust = trusted_incompressibility_test(U, grid)
+
     print(f"=== {label} ===")
     print(f"kinetic energy (full)     = {ke_full:.6e}")
     print(f"kinetic energy (trusted)  = {ke_trust:.6e}")
@@ -147,6 +174,8 @@ def print_velocity_diagnostics(label: str, U: np.ndarray, grid: Grid2D) -> None:
     print(f"mean|div u| (full)        = {div_mean:.6e}")
     print(f"max|div u| (trusted)      = {div_t_max:.6e}")
     print(f"mean|div u| (trusted)     = {div_t_mean:.6e}")
+    print(f"Qian test (full)          = {qian_full:.6e}")
+    print(f"Qian test (trusted)       = {qian_trust:.6e}")
 
 
 def print_dns_history(history: dict[str, list], grid: Grid2D) -> None:

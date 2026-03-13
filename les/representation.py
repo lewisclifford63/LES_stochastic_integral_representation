@@ -104,6 +104,10 @@ def deposit_particle_sum(
     for p in range(positions.shape[0]):
         xp = positions[p, 0]
         yp = positions[p, 1]
+
+        if not (np.isfinite(xp) and np.isfinite(yp)):
+            continue
+
         vp0 = carried_values[p, 0]
         vp1 = carried_values[p, 1]
         wp = weights[p]

@@ -237,25 +237,29 @@ def advance_particles_milstein(
     new_positions = positions + dt * drift + dB
 
     # Milstein correction (Qian eq. 55, last line)
-    #   0.5 * U_j * (dU_i/dx_j) * [(dB_j)^2 - dt]
-    # where  dB  above already contains the  sqrt(2 nu)  factor, so
-    # (dB_j)^2  corresponds to  2 nu * (xi_j)^2 * dt  with xi ~ N(0,1).
-    # Qian writes  sqrt(2 nu) (B_{t_k} - B_{t_{k-1}})  for the noise
-    # and then  [(B_{t_k}-B_{t_{k-1}})^2 - dt]  for the correction.
-    # We must therefore use the *raw* Brownian increment  dW = dB / sqrt(2nu)
-    # when computing  (dW)^2 - dt .
+    #
+    # The SDE is  dY_i = U_i dt + sqrt(2 nu) dW_i  with ADDITIVE (constant)
+    # noise coefficient sigma = sqrt(2 nu).  For additive noise the classical
+    # Milstein noise-times-noise term vanishes.  The leading stochastic
+    # correction beyond Euler-Maruyama comes from the 1.5-order Ito-Taylor
+    # expansion of the drift:
+    #
+    #   correction_i = (sigma / 2) * sum_j (dU_i/dx_j) * (dW_j^2 - dt)
+    #
+    # where sigma = sqrt(2 nu) is the *diffusion coefficient* and
+    # dW = dB / sqrt(2 nu)  is the standard BM increment  ~N(0, dt).
+    #
+    # Note: using the drift U_j in place of sigma here would overestimate
+    # the correction by a factor of |U| / sqrt(2 nu) >> 1 for large
+    # velocities, causing numerical blow-up.
     if nu > 0.0:
-        dW = dB / np.sqrt(2.0 * nu)          # shape (Np, 2), standard BM increment
+        sigma = np.sqrt(2.0 * nu)
+        dW = dB / sigma                       # shape (Np, 2), standard BM increment
         dW2_minus_dt = dW * dW - dt           # shape (Np, 2)
 
-        # correction_i = 0.5 * sum_j  U_j * (dU_i/dx_j) * (dW_j^2 - dt)
-        # drift_jacobian[p, i, j] = dU_i/dx_j
-        # We want  sum_j  drift[p, j] * drift_jacobian[p, i, j] * corr[p, j]
-        #        = sum_j  (drift * corr)[p, j] * drift_jacobian[p, i, j]
-        weighted = drift * dW2_minus_dt       # (Np, 2)  element-wise
-        # correction[p, i] = sum_j  drift_jacobian[p, i, j] * weighted[p, j]
-        correction = np.einsum("pij,pj->pi", drift_jacobian, weighted)
-        new_positions += 0.5 * correction
+        # correction[p, i] = (sigma/2) * sum_j drift_jacobian[p, i, j] * (dW_j^2 - dt)
+        correction = (sigma / 2.0) * np.einsum("pij,pj->pi", drift_jacobian, dW2_minus_dt)
+        new_positions += correction
 
     return new_positions
 

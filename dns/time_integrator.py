@@ -1,9 +1,39 @@
+"""
+DNS time integration for the padded-box 2D Navier-Stokes reference.
+
+Uses the classical fourth-order Runge-Kutta (RK4) scheme for time
+advancement, with an FFT-based pressure projection after each full
+step to enforce the divergence-free constraint.
+
+The non-pressure RHS is:
+
+    R(U, F) = -(U · nabla)U  +  nu * Delta U  +  F
+
+One RK4 step computes:
+
+    k1 = R(U_n,         F_n)
+    k2 = R(U_n + dt/2 * k1, F_{n+1/2})
+    k3 = R(U_n + dt/2 * k2, F_{n+1/2})
+    k4 = R(U_n + dt   * k3, F_{n+1})
+
+    U_star = U_n + (dt/6)(k1 + 2*k2 + 2*k3 + k4)
+    U_{n+1} = project(U_star)
+
+For time-independent or slowly varying forcing, the distinction between
+F_n, F_{n+1/2}, F_{n+1} is minor.  We evaluate F at the appropriate
+sub-step time for correctness.
+"""
+
 import numpy as np
 
 from les.grid import Grid2D
 from les.differential_operators import convective_term, laplacian_vector
 from dns.poisson import project_velocity
 
+
+# ================================================================== #
+#  Non-pressure RHS
+# ================================================================== #
 
 def explicit_navier_stokes_rhs(
     U: np.ndarray,
@@ -14,7 +44,8 @@ def explicit_navier_stokes_rhs(
 ) -> np.ndarray:
     """
     Compute the explicit non-pressure RHS:
-        - (U dot grad) U + nu * Delta U + F
+
+        R(U, F) = -(U · nabla)U  +  nu * Delta U  +  F
     """
     _validate_vector_field(U, "U")
     _validate_vector_field(F, "F")
@@ -26,6 +57,77 @@ def explicit_navier_stokes_rhs(
     return rhs
 
 
+# ================================================================== #
+#  Single-step integrators
+# ================================================================== #
+
+def advance_velocity_rk4(
+    grid: Grid2D,
+    U_n: np.ndarray,
+    forcing_function,
+    t_n: float,
+    dt: float,
+    nu: float,
+) -> dict[str, np.ndarray]:
+    """
+    One classical RK4 step + divergence-free projection.
+
+    Parameters
+    ----------
+    grid : Grid2D
+    U_n : (Ny, Nx, 2)
+        Velocity at time t_n.
+    forcing_function : callable(grid, t) -> (Ny, Nx, 2)
+        External forcing evaluated at arbitrary time.
+    t_n : float
+        Current time.
+    dt : float
+        Time step.
+    nu : float
+        Kinematic viscosity.
+
+    Returns
+    -------
+    dict with keys:
+        'U_np1'   projected velocity at t_{n+1}
+        'U_star'  pre-projection velocity
+        'p_corr'  pressure correction field
+    """
+    _validate_grid_vector_field(grid, U_n, "U_n")
+
+    dx, dy = grid.dx, grid.dy
+
+    # Stage 1:  k1 = R(U_n, F(t_n))
+    F1 = forcing_function(grid, t_n)
+    k1 = explicit_navier_stokes_rhs(U_n, F1, dx, dy, nu)
+
+    # Stage 2:  k2 = R(U_n + dt/2 * k1,  F(t_n + dt/2))
+    U2 = U_n + 0.5 * dt * k1
+    F2 = forcing_function(grid, t_n + 0.5 * dt)
+    k2 = explicit_navier_stokes_rhs(U2, F2, dx, dy, nu)
+
+    # Stage 3:  k3 = R(U_n + dt/2 * k2,  F(t_n + dt/2))
+    U3 = U_n + 0.5 * dt * k2
+    k3 = explicit_navier_stokes_rhs(U3, F2, dx, dy, nu)
+
+    # Stage 4:  k4 = R(U_n + dt * k3,  F(t_n + dt))
+    U4 = U_n + dt * k3
+    F4 = forcing_function(grid, t_n + dt)
+    k4 = explicit_navier_stokes_rhs(U4, F4, dx, dy, nu)
+
+    # Combine
+    U_star = U_n + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    # Project onto divergence-free
+    U_np1, p_corr = project_velocity(U_star, dx=dx, dy=dy)
+
+    return {
+        "U_np1": U_np1,
+        "U_star": U_star,
+        "p_corr": p_corr,
+    }
+
+
 def advance_velocity_one_step(
     grid: Grid2D,
     U_n: np.ndarray,
@@ -34,11 +136,9 @@ def advance_velocity_one_step(
     nu: float,
 ) -> dict[str, np.ndarray]:
     """
-    One explicit Euler + projection step.
+    LEGACY — one explicit Euler + projection step.
 
-    Step:
-        U_star = U_n + dt * RHS(U_n)
-        U_np1  = projection(U_star)
+    Retained for backward compatibility with tests.
     """
     _validate_grid_vector_field(grid, U_n, "U_n")
     _validate_grid_vector_field(grid, F_n, "F_n")
@@ -62,6 +162,10 @@ def advance_velocity_one_step(
     }
 
 
+# ================================================================== #
+#  Time loop
+# ================================================================== #
+
 def run_time_loop(
     grid: Grid2D,
     U_0: np.ndarray,
@@ -73,7 +177,10 @@ def run_time_loop(
     save_every: int = 1,
 ) -> dict[str, list]:
     """
-    Run the DNS time loop and store snapshots.
+    Run the DNS time loop using RK4 and store snapshots.
+
+    The interface is identical to the old Euler version so that
+    ``dns/main.py`` does not need any changes.
     """
     _validate_grid_vector_field(grid, U_0, "U_0")
 
@@ -95,12 +202,11 @@ def run_time_loop(
     }
 
     for step in range(1, num_steps + 1):
-        F_n = forcing_function(grid, t_n)
-
-        result = advance_velocity_one_step(
+        result = advance_velocity_rk4(
             grid=grid,
             U_n=U_n,
-            F_n=F_n,
+            forcing_function=forcing_function,
+            t_n=t_n,
             dt=dt,
             nu=nu,
         )
@@ -112,11 +218,16 @@ def run_time_loop(
             history["times"].append(t_n)
             history["U"].append(U_n.copy())
             history["U_star"].append(result["U_star"].copy())
-            history["rhs"].append(result["rhs_n"].copy())
+            # Store empty rhs for interface compatibility
+            history["rhs"].append(np.zeros_like(U_n))
             history["p_corr"].append(result["p_corr"].copy())
 
     return history
 
+
+# ================================================================== #
+#  Validation helpers
+# ================================================================== #
 
 def _validate_vector_field(U: np.ndarray, name: str) -> None:
     if U.ndim != 3 or U.shape[-1] != 2:

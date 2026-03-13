@@ -121,7 +121,7 @@ def main() -> None:
         t0=cfg.t0,
         pressure_cutoff_radius=cfg.pressure_cutoff_radius,
         pressure_softening=cfg.pressure_softening,
-        clip_to_box=False,
+        clip_to_box=True,
         use_milstein=True,
         save_every=cfg.save_every,
     )
@@ -182,10 +182,14 @@ def build_initial_velocity(grid: Grid2D, kind: str = "taylor_green") -> np.ndarr
         return taylor_green_velocity(grid)
 
     if kind == "gaussian_vortex":
+        # Qian-aligned scales:  max speed ~ U0 ~ 32  for Re = 1000
+        # gaussian_vortex max speed = strength * exp(-0.5) at r = sigma
+        # => strength = U0 / exp(-0.5) ~ 52.5
+        # sigma ~ L_trust / 3 ~ 1.57  so vortex fits inside trusted region
         return gaussian_vortex_velocity(
             grid=grid,
-            strength=1.0,
-            sigma=0.4,
+            strength=52.5,
+            sigma=1.57,
             center=(0.0, 0.0),
         )
 
@@ -193,8 +197,23 @@ def build_initial_velocity(grid: Grid2D, kind: str = "taylor_green") -> np.ndarr
 
 
 def build_forcing_function():
+    """
+    Qian-aligned forcing for unbounded R^2.
+
+    Qian Experiment 1 uses  F = (10 * exp(-r^2 / (2*sh*sv)),  -9.81).
+    For our unbounded case we use a localized Gaussian forcing in x
+    with amplitude 10 and width matching the vortex scale (~1.57).
+    """
+    from les.forcing import gaussian_forcing
+
     def forcing(grid: Grid2D, t: float) -> np.ndarray:
-        return constant_forcing(grid=grid, t=t, fx=0.5, fy=0.0)
+        return gaussian_forcing(
+            grid=grid,
+            t=t,
+            amplitude=(10.0, 0.0),
+            sigma=1.57,
+            center=(0.0, 0.0),
+        )
 
     return forcing
 

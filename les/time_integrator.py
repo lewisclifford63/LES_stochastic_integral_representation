@@ -29,7 +29,7 @@ are retained unchanged so that existing tests still pass.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TypedDict
 
 import numpy as np
 
@@ -40,6 +40,14 @@ from les.representation import (
     one_step_velocity_update,
 )
 from les.les_filtering import apply_spatial_filter
+
+
+class _QianStepResult(TypedDict):
+    U_np1: np.ndarray
+    particle_state: dict[str, np.ndarray]
+    source_n: np.ndarray
+    grad_p_n: np.ndarray
+    g_n: np.ndarray
 
 
 # ================================================================== #
@@ -89,7 +97,7 @@ def advance_velocity_one_step_qian(
     pressure_softening: float = 1.0e-10,
     clip_to_box: bool = False,
     use_milstein: bool = True,
-) -> dict[str, Any]:
+) -> _QianStepResult:
     """
     Advance the velocity by one stochastic step using the full
     accumulated-history scheme (Qian eqs. 41-44 / 54-56).
@@ -122,16 +130,36 @@ def advance_velocity_one_step_qian(
         'grad_p_n'        (Ny, Nx, 2)   pressure gradient
         'g_n'             (Ny, Nx, 2)   G = -grad P + F
     """
-    # 1. Compute  G_n = -grad P_n + F_n  on the grid
+    # 1. Filter U_n before computing the pressure gradient.
+    #
+    #    The filtered NSE (Qian eq. 36/39) operates on the filtered
+    #    velocity  u_tilde.  The pressure Poisson source involves
+    #    quadratic products of velocity gradients (eq. 44), so
+    #    grid-scale stochastic noise in the raw reconstruction would
+    #    be amplified quadratically and fed back into G.  Applying the
+    #    LES filter here is consistent with the filtered formulation
+    #    and suppresses this noise feedback loop.
+    #
+    #    The raw (unfiltered) U_n is still passed to the particle
+    #    update for drift interpolation and Milstein gradients.
+    U_n_filtered = apply_spatial_filter(
+        grid=grid,
+        U=U_n,
+        sigma=filter_width,
+        cutoff_sigma=filter_cutoff_sigma,
+        normalize=True,
+    )
+
+    # 2. Compute  G_n = -grad P_n + F_n  from the FILTERED velocity
     source, grad_p, g_n = compute_step_rhs(
         grid=grid,
-        U_n=U_n,
+        U_n=U_n_filtered,
         F_n=F_n,
         pressure_cutoff_radius=pressure_cutoff_radius,
         pressure_softening=pressure_softening,
     )
 
-    # 2. Accumulate history, advance particles, reconstruct U_{n+1}
+    # 3. Accumulate history, advance particles, reconstruct U_{n+1}
     U_np1, particle_state = accumulated_history_velocity_update(
         grid=grid,
         particle_state=particle_state,
